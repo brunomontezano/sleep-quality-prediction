@@ -1,0 +1,418 @@
+---
+title: "Predição de qualidade do sono: dados de fenotipagem digital"
+subtitle: "Trabalho final da disciplina PSQ 66"
+author:
+  - name: Bruno Braga Montezano
+    id: bm
+    orcid: 0000-0002-4627-1776
+    email: bmontezano@hcpa.edu.br
+    affiliation: 
+      - name: Universidade Federal do Rio Grande do Sul
+        city: Porto Alegre
+        state: RS
+        url: https://www.ufrgs.br/ppgpsiquiatria/
+license: "CC BY"
+copyright: 
+  holder: Bruno Braga Montezano
+  year: 2023
+date: today
+lang: pt-br
+theme: journal
+highlight-style: printing
+execute:
+  message: false
+  warning: false
+  cache: true
+format:
+  html:
+    code-fold: true
+    toc: true
+---
+
+# Como encontrei os dados?
+
+Ao explorar a literatura, me deparei com uma revisão sistemática que mapeou
+dados abertos sobre fenotipagem digital. Achei interessante e resolvi dar uma
+olhada no material. O artigo é intitulado [*Sensing Apps and Public Data Sets
+for Digital Phenotyping of Mental Health: Systematic Review*](https://www.jmir.org/2022/2/e28735).
+Na Tabela 4 deste artigo, existe um conjunto de dados sobre sono, que foram
+capturados pelo aplicativo *Sleep Cycle* de iOS. Os dados podem ser
+[baixados no Kaggle](https://www.kaggle.com/datasets/danagerous/sleep-data).
+Após baixados, os dados foram carregados com a função `read_csv2` do pacote
+`readr`.
+
+
+```{r carregar-dados}
+# Ler dados com pacote readr
+df <- readr::read_csv2("./data/sleep_data.csv")
+```
+
+Após a leitura dos dados, extraí 10 amostras aleatórias para imprimir na tela
+a fim de exemplificar o formato dos dados. Para tal, usou-se a função
+`slice_sample` do pacote `dplyr`.
+
+```{r olhar-dados-brutos}
+set.seed(1)
+df |>
+    # Pegar 10 entradas aleatórias
+    dplyr::slice_sample(n = 10) |>
+    # Imprimir com knitr
+    knitr::kable(caption = "Dados brutos baixados do Kaggle ($n=887$).")
+```
+
+# Qual a pergunta de pesquisa?
+
+Considerando a dificuldade para trabalhar com estes dados a partir de uma
+perspectiva de séries temporais, optei por tratar cada entrada do conjunto
+de dados como uma *sample* independente. Nesse caso, meu objetivo é elaborar
+um modelo de regressão para estimar a qualidade do sono em uma noite específica,
+a partir de dados como frequência cardíaca, humor que o sujeito acordou,
+número de passos durante do dia, tempo na cama, se comeu tarde, bebeu café
+ou chá e se o sujeito teve um dia estressante.
+
+# Como limpei os dados?
+
+Para a limpeza dos dados, (1) usei a função `clean_names` do pacote `janitor`
+para simplificar os nomes das colunas; (2) removi as colunas de data e hora
+de início e fim dos tempos na cama; (3) criei uma nova variável com o tempo
+na cama a partir da variável original em formato de data; (4) processei a
+variável `sleep_notes` para indicadores sobre dormir tarde, tomar café,
+tomar chá, ter um dia estressante, realizar um treino; (5) recodifiquei algumas
+variáveis para *labels* mais compreensíveis. Para tal, usei funções dos pacotes
+`dplyr` e `tidyr`.
+
+```{r limpeza}
+cleaned_df <- df |>
+  # Limpar nomes das colunas
+  janitor::clean_names() |>
+  # Remover variáveis que não serão usadas
+  dplyr::select(-c(start, end)) |>
+  # Transformar tempo na cama em caractere
+  dplyr::mutate(time_in_bed = as.character(time_in_bed)) |>
+  tidyr::separate_wider_delim(
+    cols = time_in_bed,
+    delim = ":",
+    names = c("hours", "minutes", "seconds")
+  ) |>
+  # Transformar colunas novas em numérico
+  dplyr::mutate(
+    dplyr::across(
+      c(hours, minutes, seconds),
+      \(x) as.numeric(x)
+    ),
+    # Criar coluna numérica do tempo na cama
+    time_in_bed = hours + (minutes / 60),
+    .keep = "unused"
+  ) |>
+  dplyr::mutate(
+    # Transformar em coluna numérica
+    sleep_quality = readr::parse_number(sleep_quality),
+    # Detectar strings para criar as novas features
+    ate_late = stringr::str_detect(sleep_notes, "Ate late"),
+    drank_coffee = stringr::str_detect(sleep_notes, "Drank coffee"),
+    stressful_day = stringr::str_detect(sleep_notes, "Stressful day"),
+    worked_out = stringr::str_detect(sleep_notes, "Worked out"),
+    drank_tea = stringr::str_detect(sleep_notes, "Drank tea"),
+    # Recodificar os TRUE/FALSE das variáveis das notas
+    dplyr::across(
+      c(ate_late, drank_coffee, stressful_day, worked_out, drank_tea),
+      \(x) as.factor(dplyr::if_else(
+        x == TRUE, "yes", "no",
+        missing = "no"
+      ))
+    ),
+    # Recodificar o humor ao acordar
+    wake_up = as.factor(dplyr::case_match(
+      wake_up,
+      ":(" ~ "sad",
+      ":|" ~ "neutral",
+      ":)" ~ "happy"
+    ))
+  ) |>
+  # Não precisamos mais das colunas abaixo
+  dplyr::select(-c(sleep_notes, hours, minutes, seconds))
+```
+
+Novamente, após a limpeza, usamos a função `slice_sample` para imprimir
+10 entradas do conjunto limpo para demonstrar o que foi realizado.
+
+```{r olhar-dados-limpos}
+set.seed(1)
+cleaned_df |>
+    # Pegar 10 entradas aleatórias
+    dplyr::slice_sample(n = 10) |>
+    # Imprimir com knitr
+    knitr::kable(caption = "Conjunto de dados após limpeza inicial ($n=887$).")
+```
+
+# Como separei os dados e organizei-os para validação cruzada?
+
+Para o fluxo de modelagem, 75% dos dados foram separados para o conjunto de
+treino, e os 25% restantes para o conjunto de teste. A divisão foi estratificada
+para manter distribuições semelhantes do desfecho (estratificado por quartis).
+Esta primeira divisão foi realizada com a função `initial_split` do pacote
+`rsample`. A partir da base de treino, construímos um objeto com 10 *folds*
+(repartições) para rodar a validação cruzada. O processo será repetido por
+10 vezes.
+
+```{r separar-dados-e-validacao}
+# Criar objeto da divisão dos conjuntos
+set.seed(1)
+data_split <- rsample::initial_split(
+  data = cleaned_df,
+  strata = "sleep_quality",
+  prop = 0.75
+)
+
+# Criar os conjuntos de treino e teste
+df_train <- rsample::training(data_split)
+df_test <- rsample::testing(data_split)
+
+# Criar um objeto para k-fold CV
+set.seed(1)
+folds <- rsample::vfold_cv(df_train, v = 10, repeats = 10)
+```
+
+# Os dados foram pré-processados?
+
+Sim. Para o pré-processamento, foram criados indicadores para os valores
+ausentes de todos os preditores do modelo (através da função `step_indicate_na`
+do pacote `recipes`) para captar uma possível associação entre a presença de
+valor ausente em uma variável e o desfecho. As variáveis com nenhuma ou
+pouquíssima variância foram removidas por meio da função `recipes::step_nzv`
+(ver documentação para compreender o critério).
+Após, as variáveis preditoras foram imputadas por meio de mediana e moda com
+as funções `step_impute_mode` e `step_impute_median`.
+Por fim, as variáveis categóricas foram transformadas em *dummy* pois a
+implementação do XGBoost a ser usada aceita apenas valores de entrada
+numéricos.
+
+```{r pre-processamento}
+# Criar uma receita de pré-processamento
+sleep_recipe <- recipes::recipe(
+  sleep_quality ~ .,
+  # Indicar que o pré-processamento deve ser feito em cima do dado de treino
+  # É importante pontuar que o workflow posteriormente vai garantir que as
+  # medianas por exemplo da imputação sejam calculadas em cima das medidas
+  # dos folds de treinamento e imputadas no fold de teste, não permitindo
+  # o vazamento de dados
+  data = df_train
+) |>
+  # Criar indicadores para missing
+  recipes::step_indicate_na(recipes::all_predictors()) |>
+  # Remover variáveis sem ou quase nenhuma variabilidade
+  recipes::step_nzv(recipes::all_predictors()) |>
+  # Imputar variáveis categóricas por moda
+  recipes::step_impute_mode(recipes::all_nominal_predictors()) |>
+  # Imputar variáveis numéricas por mediana
+  recipes::step_impute_median(recipes::all_numeric_predictors()) |>
+  # Criar dummies para as categóricas
+  recipes::step_dummy(recipes::all_nominal_predictors())
+
+# Checar como o dataset pré-processado ficou
+sleep_recipe |>
+  recipes::prep() |>
+  recipes::bake(new_data = NULL) |>
+    # Pegar 10 entradas aleatórias
+    dplyr::slice_sample(n = 10) |>
+    # Imprimir com knitr
+    knitr::kable(caption = "Conjunto de treino após pré-processamento (exemplo com 10 amostras).")
+```
+
+# Qual algoritmo foi usado?
+
+Para resolver esta tarefa, optou-se por um XGBoost para resolver o problema.
+Talvez modelos menos flexíveis pudessem ser mais adequados, mas por se tratar
+de uma tarefa de casa simulada, não viu-se problema em realizar esta opção.
+
+Os seguintes parâmetros do modelo foram tunados: `mtry`, `min_n`, `tree_depth`,
+`loss_reduction`, `learn_rate`, e `sample_size`. O número de árvores do modelo
+foi fixado em 1.000 (`trees`). Segue abaixo o código onde o algoritmo é
+declarado.
+
+```{r declarar-modelo}
+# Pegar n de núcleos do CPU
+cores <- parallel::detectCores()
+
+# Declarar o modelo de XGBoost e quais hiperparâmetros serão tunados
+xgb_spec <- parsnip::boost_tree(
+  # mtry: Número de preditores a serem sorteados em cada split
+  mtry = tune::tune(),
+  # trees: Número de árvores (fixado em 1k)
+  trees = 1000,
+  # min_n: Número mínimo de data points em um nó para continuar dividindo
+  min_n = tune::tune(),
+  # tree_depth: Profundidade máxima da árvore (# de splits)
+  tree_depth = tune::tune(),
+  # loss_reduction: Número para redução da função de custo necessário para
+  # seguir dividindo
+  loss_reduction = tune::tune(),
+  # learn_rate: Taxa em que o algoritmo vai modificar de i-para-i
+  learn_rate = tune::tune(),
+  # Quantidade de dados exposta ao ajuste
+  sample_size = tune::tune()
+) |>
+  parsnip::set_mode("regression") |>
+  parsnip::set_engine("xgboost")
+```
+
+Após a declaração do algoritmo, realiza-se a criação da grade de
+hiperparâmetros, onde são elaboradas 30 combinações diferentes de
+parâmetros para serem testados no 10-fold CV repetido por 10 vezes.
+
+```{r grid-de-parametros}
+set.seed(1)
+# Criar grid de hiperparâmetros
+# Usando métodos de preenchimento de espaço
+xgb_grid <- dials::grid_latin_hypercube(
+  dials::tree_depth(),
+  dials::min_n(),
+  dials::loss_reduction(),
+  # Para entender os defaults do sample_prop, ver documentação
+  sample_size = dials::sample_prop(),
+  dials::finalize(dials::mtry(), df_train),
+  dials::learn_rate(),
+  size = 30
+)
+```
+
+Por fim, juntei a receita de pré-processamento e o modelo especificado
+em um objeto de *workflow* para ajustar os modelos da validação posteriormente.
+Para rodar a validação, usou a função `tune::tune_grid`.
+
+```{r validacao-cruzada}
+xgb_wf <- workflows::workflow() |>
+  # Adicionar pré-processamento
+  workflows::add_recipe(sleep_recipe) |>
+  # Adicionar declaração do modelo
+  workflows::add_model(xgb_spec)
+
+doParallel::registerDoParallel()
+
+set.seed(1)
+# Ajustar modelos da validação cruzada
+xgb_res <- tune::tune_grid(
+  # Objeto de workflow criado acima
+  object = xgb_wf,
+  # 10-fold cv repetido por 10 vezes criado anteriormente
+  resamples = folds,
+  # Grid criado com a função `grid_latin_hypercube`
+  grid = xgb_grid,
+  # Indicar alguns argumentos para salvar predições, permitir
+  # paralelização e ser verboso
+  control = tune::control_grid(
+    save_pred = TRUE,
+    allow_par = TRUE,
+    verbose = TRUE
+  )
+)
+```
+
+# Quais foram os resultados da validação cruzada?
+
+Para verificar os resultados, usei algumas funções como `tune::collect_metrics`
+e `tune::show_best` para checar quais foram as combinações de hiperparâmetros
+que melhor performaram durante a validação usando o *root mean squared error*
+(RMSE) como critério para avaliação do modelo.
+
+```{r resultados-validacao}
+#| output: false
+xgb_res
+
+tune::collect_metrics(xgb_res)
+
+tune::show_best(xgb_res, "rmse")
+```
+
+Abaixo, foi criado um gráfico para demonstrar a relação os valores de cada
+hiperparâmetro tunado e o valor do RMSE. O gráfico foi criado com o pacote
+`ggplot2` e os pacotes `dplyr` e `tidyr` foram usados para manipulação dos
+dados.
+
+```{r plot-validacao}
+xgb_res |>
+  tune::collect_metrics() |>
+  dplyr::filter(.metric == "rmse") |>
+  dplyr::select(mean, mtry:sample_size) |>
+  tidyr::pivot_longer(mtry:sample_size,
+    values_to = "value",
+    names_to = "parameter"
+  ) |>
+  ggplot2::ggplot(ggplot2::aes(value, mean, color = parameter)) +
+  ggplot2::geom_point(alpha = 0.8, show.legend = FALSE) +
+  ggplot2::facet_wrap(~parameter, scales = "free_x") +
+  ggplot2::theme_light(15, "IBM Plex Sans") +
+  ggplot2::labs(x = NULL, y = "RMSE")
+
+best_rmse <- tune::select_best(xgb_res, "rmse")
+```
+
+No chunk de código acima, selecionei a melhor combinação de hiperparâmetros
+pelo critério do menor RMSE.
+
+Por fim, no código abaixo eu finalizo o fluxo (*workflow*) para usar os
+melhores hiperparâmetros encontrados na validação no meu objeto do modelo
+de XGBoost (função `tune::finalize_workflow`). Então ajusto o modelo final
+com a função `tune::last_fit`, onde treino/ajusto o modelo no conjunto de
+treino e estimo as métricas de desempenho no conjunto de testes.
+
+```{r ajustar-modelo-final}
+# Atualizar os hiperparâmetros para os melhores encontrados na CV
+final_xgb <- tune::finalize_workflow(
+  xgb_wf,
+  best_rmse
+)
+
+# Ajustar o modelo final no conjunto de treino e estimar métricas no teste
+final_fit <- tune::last_fit(
+  final_xgb,
+  data_split
+)
+```
+
+# O que foi usado para interpretar o modelo?
+
+Para interpretar o modelo, usei SHAP values. O pacote `SHAPforxgboost` foi
+usado para estimar os valores e plotar em gráficos os resultados
+correspondentes. De acordo com os gráficos abaixo, os resultados sugerem que o
+tempo gasto na cama [`time_in_bed`] (quanto mais tempo na cama, melhor a
+qualidade do sono) é a variável mais influente para as predições do modelo,
+seguida por passos no dia [`activity_steps`] (quanto mais, pior a qualidade do
+sono). Tomar chá [`drank_tea_yes`] parece ter uma influência "positiva" no
+desfecho e tomar café [`drink_coffee_yes`], na direção contrária, um efeito
+negativo na qualidade do sono.
+
+Nos gráficos de dependência vemos que quanto maior o tempo na cama, maior a
+qualidade de sono. Mas o interessante é ver que parece que tempos curtos
+gastos na cama apresentam um tamanho de efeito maior na predição de uma
+má/baixa qualidade do sono do que na direção de uma potencial influência
+positiva. Já no plot do beber chá, vemos uma influência de tamanho semelhante
+em ambas direções.
+
+```{r calcular-shap}
+shap_long <- SHAPforxgboost::shap.prep(
+  xgb_model = final_fit |>
+    hardhat::extract_fit_engine(),
+  X_train = sleep_recipe |>
+    recipes::prep() |>
+    recipes::bake(new_data = final_fit$splits[[1]]$data) |>
+    dplyr::select(-sleep_quality) |>
+    as.matrix()
+)
+
+library(SHAPforxgboost)
+
+SHAPforxgboost::shap.plot.summary(shap_long)
+
+SHAPforxgboost::shap.plot.dependence(data_long = shap_long,
+                                     x = "time_in_bed")
+
+SHAPforxgboost::shap.plot.dependence(data_long = shap_long,
+                                     x = "drank_tea_yes")
+```
+
+# Informações da sessão
+
+```{r sessao}
+sessioninfo::session_info()
+```
