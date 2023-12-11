@@ -1,4 +1,4 @@
-# Trabalho final — PSQ 66 <a href='https://github.com/brunomontezano/mdd-prediction/'><img src='sleep_picture.jpg' align="right" height="139" /></a>
+# Trabalho final — PSQ 66 <a href='https://github.com/brunomontezano/sleep-quality-prediction/'><img src='sleep_picture.jpg' align="right" height="139" /></a>
 
 O presente repositório armazena o código relacionado ao trabalho final da
 disciplina "PSQ 66 — Computational psychiatry: Machine learning and deep
